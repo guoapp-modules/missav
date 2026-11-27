@@ -1,13 +1,25 @@
-const siteBaseUrl = "https://missav.live";
+const siteBaseUrl = "https://missav.ai";
+const siteCandidates = [
+  "https://missav.ai",
+  "https://missav.ws",
+  "https://missav.live",
+  "https://missav.fans",
+  "https://missav.media",
+];
 const userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36";
 const channel = "MissAV";
 
 const slugPattern = /^[a-z0-9][a-z0-9._-]{0,127}$/;
-const cardPattern = /\/(?:dm[0-9]+\/)?cn\/([a-z0-9][a-z0-9._-]{0,127})\/?$/;
-const genrePattern = /\/(?:dm[0-9]+\/)?cn\/genres\/([^/?#]+)\/?$/;
 const pagePattern = /[?&]page=([0-9]{1,7})/;
-const mediaPattern = /https?:\/\/surrit\.com\/[0-9a-f-]{36}\/playlist\.m3u8/;
+const mediaPattern = /https?:\/\/[^\s"'<>\\]+\.m3u8[^\s"'<>\\]*/g;
 const packedPattern = /eval\(function\(p,a,c,k,e,d\)\{.*?\}\('((?:[^'\\]|\\.)*)',([0-9]+),([0-9]+),'((?:[^'\\]|\\.)*)'\.split\('\|'\)/gs;
+const languageSegments = ["cn", "en", "ja", "ko", "ms", "th", "tw"];
+const reservedSlugs = [
+  "new", "release", "genres", "actresses", "makers", "search", "vip", "site", "playlists",
+  "saved", "login", "logout", "register", "today-hot", "weekly-hot", "monthly-hot",
+  "chinese-subtitle", "english-subtitle", "uncensored-leak", "vr", "articles", "about",
+  "terms", "privacy", "dmca", "contact", "random", "ranking", "rankings", "actresses-ranking",
+];
 
 function truncate(text, limit) {
   const trimmed = text.trim();
@@ -108,6 +120,14 @@ function pathEscape(text) {
     .replace(/%(?:24|26|2B|2C|3A|3B|3D|40)/g, (escaped) => kept[escaped]);
 }
 
+function decodeText(text) {
+  try {
+    return decodeURIComponent(text);
+  } catch (error) {
+    return text;
+  }
+}
+
 function htmlTree(body) {
   if (body.length > 4 << 20) {
     throw new Error("站源页面过大");
@@ -177,33 +197,51 @@ function validCategory(category) {
   return category.length <= 96 && !/[/\\?#\x00\r\n]/.test(category);
 }
 
-function coverAddress(raw) {
+function coverAddress(raw, base) {
   raw = String(raw || "").trim();
   if (raw === "" || raw.startsWith("data:")) {
     return "";
   }
-  const parsed = parseAddress(resolveUrl(siteBaseUrl + "/", raw));
+  const parsed = parseAddress(resolveUrl(base || siteBaseUrl + "/", raw));
   if (!parsed || (parsed.scheme !== "https" && parsed.scheme !== "http") || parsed.hostname === "" || parsed.userInfo) {
     return "";
   }
   return parsed.href;
 }
 
-function pathMatch(href, pattern) {
+function contentSegments(href) {
   const parsed = parseAddress(String(href || "").trim());
   if (!parsed) {
-    return "";
+    return [];
   }
-  const match = parsed.path.match(pattern);
-  return match ? match[1] : "";
+  const segments = String(parsed.path || "").split("/").filter((segment) => segment !== "");
+  if (segments.length > 0 && /^dm[0-9]+$/.test(segments[0])) {
+    segments.shift();
+  }
+  if (segments.length > 0 && languageSegments.includes(segments[0].toLowerCase())) {
+    segments.shift();
+  }
+  return segments;
 }
 
 function cardSlug(href) {
-  return pathMatch(href, cardPattern);
+  const segments = contentSegments(href);
+  if (segments.length !== 1) {
+    return "";
+  }
+  const slug = segments[0].trim();
+  if (!slugPattern.test(slug) || reservedSlugs.includes(slug.toLowerCase())) {
+    return "";
+  }
+  return slug;
 }
 
 function genreSlug(href) {
-  return pathMatch(href, genrePattern).trim();
+  const segments = contentSegments(href);
+  if (segments.length !== 2 || segments[0].toLowerCase() !== "genres") {
+    return "";
+  }
+  return decodeText(segments[1]).trim();
 }
 
 function metadataOf(document) {
@@ -255,7 +293,7 @@ function cardImage(card) {
   return fallback;
 }
 
-function parseCards(document) {
+function parseCards(document, base) {
   const cards = htmlNodes(document, (node) => node.tag === "div" && htmlClass(node, "thumbnail") && htmlClass(node, "group"));
   const items = [];
   const seen = new Set();
@@ -281,8 +319,11 @@ function parseCards(document) {
     if (title === "") {
       title = slug.toUpperCase();
     }
-    const cover = image === null ? "" : coverAddress(firstNonEmpty(htmlAttr(image, "data-src"), htmlAttr(image, "src")));
-    const badge = htmlNodes(card, (node) => node.tag === "span" && htmlClass(node, "absolute"))[0];
+    if (image === null && title === slug.toUpperCase()) {
+      continue;
+    }
+    const cover = image === null ? "" : coverAddress(firstNonEmpty(htmlAttr(image, "data-src"), htmlAttr(image, "src")), base);
+    const badge = htmlNodes(card, (node) => node.tag === "span" && htmlClass(node, "absolute") && (htmlClass(node, "bottom-1") || htmlClass(node, "left-1")))[0];
     seen.add(slug);
     items.push({
       id: host.dramaId(slug),
@@ -306,6 +347,9 @@ function hasMorePages(document, page) {
     const match = htmlAttr(anchor, "href").match(pagePattern);
     if (match) {
       maxPage = Math.max(maxPage, parseInt(match[1], 10));
+    }
+    if (htmlAttr(anchor, "rel") === "next") {
+      return true;
     }
   }
   return maxPage > page;
@@ -346,7 +390,7 @@ function symbol(index, radix) {
 function unpack(match) {
   const radix = parseInt(match[2], 10);
   const count = parseInt(match[3], 10);
-  if (!(radix >= 2 && radix <= 64) || !(count >= 1 && count <= 1024)) {
+  if (!(radix >= 2 && radix <= 64) || !(count >= 1 && count <= 2048)) {
     return "";
   }
   let payload = match[1].replace(/\\'/g, "'").replace(/\\\\/g, "\\");
@@ -361,45 +405,150 @@ function unpack(match) {
   return payload;
 }
 
-function mediaAddress(body) {
-  for (const match of body.matchAll(packedPattern)) {
-    const found = unpack(match).match(mediaPattern);
-    if (found) {
-      return found[0];
-    }
+function mediaScore(address) {
+  let score = /surrit\.com/i.test(address) ? 100000 : 0;
+  if (/\/playlist\.m3u8(?:[?#]|$)/i.test(address)) {
+    score += 10000;
   }
-  const direct = body.match(mediaPattern);
-  return direct ? direct[0] : "";
+  const quality = address.match(/\/(\d{3,4})p\//);
+  return score + (quality ? parseInt(quality[1], 10) : 1);
 }
 
-function fetchDocument(address) {
-  return htmlTree(host.fetchText({ url: address, referer: siteBaseUrl + "/", userAgent }).body);
+function mediaCandidates(body) {
+  body = String(body || "");
+  const found = [];
+  const add = (raw) => {
+    const address = String(raw || "").replace(/\\\//g, "/").trim();
+    if (address !== "" && found.indexOf(address) < 0) {
+      found.push(address);
+    }
+  };
+  for (const address of body.match(mediaPattern) || []) {
+    add(address);
+  }
+  for (const match of body.matchAll(packedPattern)) {
+    for (const address of unpack(match).match(mediaPattern) || []) {
+      add(address);
+    }
+  }
+  if (found.length === 0) {
+    const uuid = body.match(/surrit\.com\\?\/([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})/i);
+    if (uuid) {
+      add("https://surrit.com/" + uuid[1] + "/playlist.m3u8");
+    }
+  }
+  return found.sort((left, right) => mediaScore(right) - mediaScore(left));
+}
+
+function rememberSite(base) {
+  try {
+    if (host.loadState("site") !== base) {
+      host.saveState("site", base);
+    }
+  } catch (error) {
+  }
+}
+
+function siteBases() {
+  let remembered = "";
+  try {
+    remembered = String(host.loadState("site") || "").trim();
+  } catch (error) {
+    remembered = "";
+  }
+  const bases = [];
+  if (siteCandidates.includes(remembered)) {
+    bases.push(remembered);
+  }
+  for (const base of siteCandidates) {
+    if (!bases.includes(base)) {
+      bases.push(base);
+    }
+  }
+  return bases;
+}
+
+function challengePage(body) {
+  const head = String(body || "").slice(0, 4096).toLowerCase();
+  return head.includes("just a moment") || head.includes("cf-chl") || head.includes("challenge-platform") ||
+    head.includes("attention required") || head.includes("请稍候") || head.includes("檢查您的瀏覽器");
+}
+
+function fetchPage(paths, accept) {
+  const bases = siteBases();
+  let lastError = null;
+  for (const base of bases) {
+    for (const path of paths) {
+      let response;
+      try {
+        response = host.fetchText({ url: base + path, referer: base + "/", userAgent });
+      } catch (error) {
+        lastError = error;
+        const status = Number(error && error.status) || 0;
+        if (status >= 400 && status < 500 && status !== 429) {
+          continue;
+        }
+        break;
+      }
+      const body = String((response && response.body) || "");
+      if (body.trim() === "" || challengePage(body) || (accept && !accept(body))) {
+        lastError = new Error("MissAV 页面内容异常，请稍后重试或更换网络");
+        continue;
+      }
+      rememberSite(base);
+      return { base, url: base + path, body };
+    }
+  }
+  throw lastError || new Error("MissAV 无法连接");
 }
 
 function fetchCatalogPage(page, category, query) {
   if (page < 1 || page > 1000000 || query.length > 256 || !validCategory(category)) {
     throw new Error("MissAV 目录查询参数无效");
   }
-  let address = siteBaseUrl + "/cn/new";
+  const suffix = "?page=" + page;
+  let paths;
   if (query !== "") {
-    address = siteBaseUrl + "/cn/search/" + pathEscape(query);
+    const escaped = pathEscape(query);
+    paths = ["/cn/search/" + escaped + suffix, "/search/" + escaped + suffix];
   } else if (category !== "") {
-    address = siteBaseUrl + "/cn/genres/" + pathEscape(category);
+    const escaped = pathEscape(category);
+    paths = ["/cn/genres/" + escaped + suffix, "/genres/" + escaped + suffix];
+  } else {
+    paths = ["/cn/new" + suffix, "/new" + suffix, "/" + suffix];
   }
-  const document = fetchDocument(address + "?page=" + page);
-  const items = parseCards(document);
-  const hasMore = hasMorePages(document, page);
-  if (items.length === 0 && (hasMore || (page === 1 && query === "" && category === ""))) {
-    throw new Error("MissAV 未返回应有的目录页，请重试");
+  let lastError = null;
+  let emptyPage = false;
+  for (const path of paths) {
+    let pageResult;
+    try {
+      pageResult = fetchPage([path], (body) => body.includes("thumbnail"));
+    } catch (error) {
+      lastError = error;
+      continue;
+    }
+    const document = htmlTree(pageResult.body);
+    const items = parseCards(document, pageResult.base);
+    if (items.length > 0) {
+      return { items, hasMore: hasMorePages(document, page) };
+    }
+    emptyPage = true;
   }
-  return { items, hasMore };
+  if (emptyPage) {
+    if (page === 1 && query === "" && category === "") {
+      throw new Error("MissAV 未返回应有的目录页，请重试");
+    }
+    return { items: [], hasMore: false };
+  }
+  throw lastError || new Error("MissAV 无法连接");
 }
 
 module.exports = {
   validCategory,
 
   categories() {
-    const document = fetchDocument(siteBaseUrl + "/cn/genres");
+    const pageResult = fetchPage(["/cn/genres", "/genres"], (body) => body.includes("genres"));
+    const document = htmlTree(pageResult.body);
     const order = [];
     const names = {};
     for (const anchor of htmlNodes(document, tagged("a"))) {
@@ -437,15 +586,15 @@ module.exports = {
     if (!slugPattern.test(sourceId)) {
       throw new Error("MissAV 视频 ID 无效");
     }
-    const pageUrl = siteBaseUrl + "/cn/" + sourceId;
-    const document = fetchDocument(pageUrl);
+    const pageResult = fetchPage(["/cn/" + sourceId, "/" + sourceId], (body) => body.includes("og:title") || body.includes("og:image"));
+    const document = htmlTree(pageResult.body);
     const metadata = metadataOf(document);
     const title = firstNonEmpty(heading(document), metadata["og:title"], metadata["twitter:title"]);
     if (title === "") {
       throw new Error("MissAV 详情缺少视频标题");
     }
     const description = firstNonEmpty(metadata["og:description"], metadata["description"]);
-    const cover = coverAddress(firstNonEmpty(metadata["og:image"], metadata["twitter:image"], poster(document)));
+    const cover = coverAddress(firstNonEmpty(metadata["og:image"], metadata["twitter:image"], poster(document)), pageResult.base);
     const drama = {
       id: host.dramaId(sourceId),
       source: host.source,
@@ -469,24 +618,31 @@ module.exports = {
       title: "正片",
       currentEpisode: 1,
       videoUrl: "missav-play://" + sourceId,
-      pageUrl,
-      referer: pageUrl,
+      pageUrl: pageResult.url,
+      referer: pageResult.url,
     };
     return { drama, chapters: [chapter] };
   },
 
   resolveMedia(task) {
     const dramaPrefix = host.source + ":";
-    const sourceId = task.dramaId.startsWith(dramaPrefix) ? task.dramaId.slice(dramaPrefix.length).trim() : "";
-    if (!slugPattern.test(sourceId) || !task.chapter.id.startsWith(host.chapterId(sourceId, ""))) {
+    const sourceId = String(task.dramaId || "").startsWith(dramaPrefix) ? task.dramaId.slice(dramaPrefix.length).trim() : "";
+    if (!slugPattern.test(sourceId) || !String((task.chapter && task.chapter.id) || "").startsWith(host.chapterId(sourceId, ""))) {
       throw new Error("MissAV 播放分集信息无效，请刷新详情");
     }
-    const pageUrl = siteBaseUrl + "/cn/" + sourceId;
-    const body = host.fetchText({ url: pageUrl, referer: siteBaseUrl + "/", userAgent }).body;
-    const address = mediaAddress(body);
-    if (address === "") {
+    const pageResult = fetchPage(["/cn/" + sourceId, "/" + sourceId], (body) => body.includes("surrit") || body.includes(".m3u8"));
+    const candidates = mediaCandidates(pageResult.body);
+    if (candidates.length === 0) {
       throw new Error("MissAV 页面里未解析到播放地址");
     }
-    return host.prepareWebMedia({ url: address, referer: pageUrl }, channel);
+    let lastError = null;
+    for (const address of candidates) {
+      try {
+        return host.prepareWebMedia({ url: address, referer: pageResult.url }, channel);
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    throw lastError || new Error("MissAV 播放地址不可用，请重试");
   },
 };
